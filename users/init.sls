@@ -38,7 +38,8 @@ include:
 {%- if user == None -%}
 {%- set user = {} -%}
 {%- endif -%}
-{%- set home = user.get('home', "/home/%s" % name) -%}
+{%- set current = salt.user.info(name) -%}
+{%- set home = user.get('home', current.get('home', "/home/%s" % name)) -%}
 
 {%- if 'prime_group' in user and 'name' in user['prime_group'] %}
 {%- set user_group = user.prime_group.name -%}
@@ -59,8 +60,8 @@ users_{{ name }}_user:
   {% if user.get('createhome', True) %}
   file.directory:
     - name: {{ home }}
-    - user: {{ name }}
-    - group: {{ user_group }}
+    - user: {{ user.get('homedir_owner', name) }}
+    - group: {{ user.get('homedir_group', user_group) }}
     - mode: {{ user.get('user_dir_mode', '0750') }}
     - require:
       - user: users_{{ name }}_user
@@ -73,10 +74,13 @@ users_{{ name }}_user:
     {%- elif 'uid' in user %}
     - gid: {{ user['uid'] }}
     {%- endif %}
+    {% if 'system' in user and user['system'] %}
+    - system: True
+    {% endif %}
   user.present:
     - name: {{ name }}
     - home: {{ home }}
-    - shell: {{ user.get('shell', users.get('shell', '/bin/bash')) }}
+    - shell: {{ user.get('shell', current.get('shell', users.get('shell', '/bin/bash'))) }}
     {% if 'uid' in user -%}
     - uid: {{ user['uid'] }}
     {% endif -%}
@@ -88,6 +92,9 @@ users_{{ name }}_user:
     {% endif -%}
     {% if 'enforce_password' in user -%}
     - enforce_password: {{ user['enforce_password'] }}
+    {% endif -%}
+    {% if 'hash_password' in user -%}
+    - hash_password: {{ user['hash_password'] }}
     {% endif -%}
     {% if user.get('system', False) -%}
     - system: True
@@ -131,6 +138,12 @@ users_{{ name }}_user:
       {% for group in user.get('groups', []) -%}
       - {{ group }}
       {% endfor %}
+    {% if 'optional_groups' in user %}
+    - optional_groups:
+      {% for optional_group in user['optional_groups'] -%}
+      - {{optional_group}}
+      {% endfor %}
+    {% endif %}
     - require:
       - group: {{ user_group }}
       {% for group in user.get('groups', []) -%}
@@ -146,7 +159,7 @@ users_{{ name }}_user:
       'ssh_config' in user %}
 user_keydir_{{ name }}:
   file.directory:
-    - name: {{ user.get('home', '/home/{0}'.format(name)) }}/.ssh
+    - name: {{ home }}/.ssh
     - user: {{ name }}
     - group: {{ user_group }}
     - makedirs: True
@@ -163,8 +176,7 @@ user_keydir_{{ name }}:
   {% set key_type = 'id_' + user.get('ssh_key_type', 'rsa') %}
 users_user_{{ name }}_private_key:
   file.managed:
-    - name: {{ user.get('home',
-                  '/home/{0}'.format(name)) }}/.ssh/{{ key_type }}
+    - name: {{ home }}/.ssh/{{ key_type }}
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 600
@@ -177,8 +189,7 @@ users_user_{{ name }}_private_key:
       {% endfor %}
 users_user_{{ name }}_public_key:
   file.managed:
-    - name: {{ user.get('home',
-                  '/home/{0}'.format(name)) }}/.ssh/{{ key_type }}.pub
+    - name: {{ home }}/.ssh/{{ key_type }}.pub
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 644
@@ -204,9 +215,8 @@ users_authorized_keys_{{ name }}:
         {{ auth }}
         {% endfor -%}
 {% else %}
-    - contents: |
-        {%- for key_name, pillar_name in user['ssh_auth_pillar'].iteritems() %}
-        {{ salt['pillar.get'](pillar_name + ':' + key_name + ':pubkey', '') }}
+        {%- for key_name, pillar_name in user['ssh_auth_pillar'].items() %}
+    - contents_pillar: {{ pillar_name }}:{{ key_name }}:pubkey
         {%- endfor %}
 {% endif %}
 {% endif %}
@@ -218,7 +228,7 @@ users_ssh_auth_{{ name }}_{{ loop.index0 }}:
     - user: {{ name }}
     - name: {{ auth }}
     - require:
-        - file: users_{{ name }}_user
+        - file: user_keydir_{{ name }}
         - user: users_{{ name }}_user
 {% endfor %}
 {% endif %}
@@ -227,8 +237,7 @@ users_ssh_auth_{{ name }}_{{ loop.index0 }}:
 {% for key_name, pillar_name in user['ssh_keys_pillar'].items() %}
 user_ssh_keys_files_{{ name }}_{{ key_name }}_private_key:
   file.managed:
-    - name: {{ user.get('home',
-                  '/home/{0}'.format(name)) }}/.ssh/{{ key_name }}
+    - name: {{ home }}/.ssh/{{ key_name }}
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 600
@@ -241,8 +250,7 @@ user_ssh_keys_files_{{ name }}_{{ key_name }}_private_key:
       {% endfor %}
 user_ssh_keys_files_{{ name }}_{{ key_name }}_public_key:
   file.managed:
-    - name: {{ user.get('home',
-                  '/home/{0}'.format(name)) }}/.ssh/{{ key_name }}.pub
+    - name: {{ home }}/.ssh/{{ key_name }}.pub
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 644
@@ -336,6 +344,7 @@ users_ssh_known_hosts_delete_{{ name }}_{{ loop.index0 }}:
 
 users_sudoer-{{ name }}:
   file.managed:
+    - replace: False
     - name: {{ users.sudoers_dir }}/{{ name }}
     - user: root
     - group: {{ users.root_group }}
@@ -374,6 +383,7 @@ users_sudoer-{{ name }}:
 
 users_{{ users.sudoers_dir }}/{{ name }}:
   file.managed:
+    - replace: True
     - name: {{ users.sudoers_dir }}/{{ name }}
     - contents: |
       {%- if 'sudo_defaults' in user %}
@@ -382,6 +392,11 @@ users_{{ users.sudoers_dir }}/{{ name }}:
       {%- endfor %}
       {%- endif %}
       {%- if 'sudo_rules' in user %}
+        ########################################################################
+        # File managed by Salt (users-formula).
+        # Your changes will be overwritten.
+        ########################################################################
+        #
       {%- for rule in user['sudo_rules'] %}
         {{ name }} {{ rule }}
       {%- endfor %}
@@ -389,10 +404,10 @@ users_{{ users.sudoers_dir }}/{{ name }}:
     - require:
       - file: users_sudoer-defaults
       - file: users_sudoer-{{ name }}
-  cmd.wait:                                                                           
+  cmd.wait:
     - name: visudo -cf {{ users.sudoers_dir }}/{{ name }} || ( rm -rvf {{ users.sudoers_dir }}/{{ name }}; exit 1 )
-    - watch:                                                                         
-      - file: {{ users.sudoers_dir }}/{{ name }}   
+    - watch:
+      - file: {{ users.sudoers_dir }}/{{ name }}
 {% endif %}
 {% else %}
 users_{{ users.sudoers_dir }}/{{ name }}:
@@ -415,6 +430,19 @@ users_googleauth-{{ svc }}-{{ name }}:
 {%- endfor %}
 {%- endif %}
 
+#
+# if not salt['cmd.has_exec']('git')
+# fails even if git is installed
+#
+# this doesn't work (Salt bug), therefore need to run state.apply twice
+#include:
+#  - users
+#
+#git:
+#  pkg.installed:
+#    - require_in:
+#      - sls: users
+#
 {% if 'gitconfig' in user %}
 {% for key, value in user['gitconfig'].items() %}
 users_{{ name }}_user_gitconfig_{{ loop.index0 }}:
@@ -460,7 +488,8 @@ users_{{ users.sudoers_dir }}/{{ name }}:
 
 {% for user in pillar.get('absent_users', []) %}
 users_absent_user_2_{{ user }}:
-  user.absent
+  user.absent:
+    - name: {{ user }}
 users_2_{{ users.sudoers_dir }}/{{ user }}:
   file.absent:
     - name: {{ users.sudoers_dir }}/{{ user }}
